@@ -1,17 +1,17 @@
-import os
-import time
-import signal
 import csv
+import os
+import signal
+import time
 from datetime import datetime
+
+import cv2
 from picamera2 import Picamera2
 from ultralytics import YOLO
-import cv2
 
 # Variables globales
 CAPTURE_INTERVAL = 20  # Segundos entre capturas de pantalla (por defecto 20 segundos)
 ENABLE_VISUALIZATION = False  # Controla si se muestra la ventana de video (True/False)
 DETECTION_LIST = ["person"]  # Siempre detecta personas
-BLACKLIST = ["cell phone"]  # Nunca detecta teléfonos
 
 # Crear la carpeta de salida si no existe
 output_folder = "output"
@@ -56,13 +56,10 @@ def filtrar_detecciones(results):
         confidence = float(result[4])
         object_name = model.names[object_class]
 
-        # Aplicar lista blanca (detección) y lista negra (exclusión)
-        if object_name in BLACKLIST:
-            continue
         if object_name in DETECTION_LIST or "person" in object_name:
             detected_objects.append(object_name)
             confidences.append(round(confidence, 2))  # Redondear a 2 decimales
-            
+
             # Coordenadas de la caja delimitadora
             x_min, y_min, x_max, y_max = map(int, result[:4])
             coordinates.append([x_min, y_min, x_max, y_max])

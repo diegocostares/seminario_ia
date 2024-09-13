@@ -1,32 +1,38 @@
-import os
-import time
-import signal
 import csv
 import logging
+import os
+import signal
+import threading
+import time
 from datetime import datetime
-from picamera2 import Picamera2
-from ultralytics import YOLO
+from multiprocessing import Event, Process, Queue
+
 import cv2
 import numpy as np
-from multiprocessing import Process, Queue
+from picamera2 import Picamera2
+from ultralytics import YOLO
 
 # Configuración del registro (logging)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Clase de Configuración
+
 class Config:
     ENABLE_VISUALIZATION = False  # Controla si se muestra la ventana de video (True/False)
     DETECTION_LIST = ["person"]  # Lista de objetos a detectar
-    CONFIDENCE_THRESHOLD = 0.5  # Confianza mínima para detectar objetos
+    CONFIDENCE_THRESHOLD = 0.15  # Confianza mínima para detectar objetos
     OUTPUT_FOLDER = "output"  # Carpeta de salida para imágenes y CSV
     CSV_FILENAME = "detections.csv"  # Nombre del archivo CSV para almacenar resultados
     MIN_MOTION_AREA = 5000  # Área mínima de movimiento para considerar que hay cambio
     RESIZE_WIDTH = 640  # Ancho al que se redimensionará la imagen para detección de movimiento
     CAMERA_RESOLUTION = (640, 360)  # Resolución de la cámara (ancho, alto)
     MODEL_NAME = "yolov8x.pt"  # Modelo YOLOv8 a utilizar (nano para mayor velocidad)
+    CSV_BUFFER_SIZE = 2  # Número de entradas antes de escribir en el CSV
+    MOTION_DETECTION_COOLDOWN = 5  # Segundos de espera después de detectar movimiento
 
-# Clase para manejar la detección de objetos
+
 class ObjectDetector:
+    """Clase para manejar la detección de objetos con YOLOv8"""
+
     def __init__(self, config):
         self.config = config
         # Cargar el modelo YOLOv8 especificado
@@ -57,7 +63,7 @@ class ObjectDetector:
         coordinates = []
         areas = []
         # Verificar si hay detecciones
-        if results[0].boxes is not None:
+        if results[0].boxes is not None and len(results[0].boxes.data) > 0:
             for result in results[0].boxes.data:
                 object_class = int(result[5])
                 confidence = float(result[4])
@@ -82,11 +88,16 @@ class ObjectDetector:
 
         return detected_objects, confidences, coordinates, areas
 
-# Clase para manejar la cámara y las capturas
-class CameraHandler:
-    def __init__(self, config, frame_queue):
+
+class FrameCapture(threading.Thread):
+    """Hilo para capturar frames de la cámara y detectar movimiento"""
+
+    def __init__(self, config, frame_queue, motion_event, stop_event):
+        threading.Thread.__init__(self)
         self.config = config
         self.frame_queue = frame_queue
+        self.motion_event = motion_event
+        self.stop_event = stop_event
         self.picam2 = Picamera2()
         self.configure_camera()
         logging.info("Cámara inicializada y configurada.")
@@ -97,15 +108,19 @@ class CameraHandler:
         self.picam2.configure(config)
         self.picam2.start()
 
-    def capture_frames(self):
+    def run(self):
         prev_frame = None
-        while True:
+        last_motion_time = None
+
+        while not self.stop_event.is_set():
             # Capturar un frame de la cámara
             frame = self.picam2.capture_array()
 
             # Convertir el frame a escala de grises para detección de movimiento
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            gray = cv2.resize(gray, (self.config.RESIZE_WIDTH, int(gray.shape[0] * self.config.RESIZE_WIDTH / gray.shape[1])))
+            gray = cv2.resize(
+                gray, (self.config.RESIZE_WIDTH, int(gray.shape[0] * self.config.RESIZE_WIDTH / gray.shape[1]))
+            )
             gray = cv2.GaussianBlur(gray, (21, 21), 0)
 
             if prev_frame is None:
@@ -125,105 +140,97 @@ class CameraHandler:
                 motion_detected = True
                 break
 
-            # Si se detecta movimiento, enviar el frame para procesamiento
-            if motion_detected:
-                logging.info("Movimiento detectado.")
-                self.frame_queue.put(frame)
+            current_time = datetime.now()
 
-            # Actualizar el frame anterior
+            if motion_detected:
+                if (
+                    last_motion_time is None
+                    or (current_time - last_motion_time).total_seconds() > self.config.MOTION_DETECTION_COOLDOWN
+                ):
+                    logging.info("Movimiento detectado. Iniciando captura.")
+                    self.frame_queue.put(frame)
+                    last_motion_time = current_time
+                    # Señalar que se ha detectado movimiento
+                    self.motion_event.set()
+                else:
+                    logging.debug("Movimiento detectado, pero en periodo de enfriamiento.")
+            else:
+                # Si ha pasado el periodo de enfriamiento, resetear el evento
+                if (
+                    last_motion_time
+                    and (current_time - last_motion_time).total_seconds() > self.config.MOTION_DETECTION_COOLDOWN
+                ):
+                    self.motion_event.clear()
+                    last_motion_time = None
+
             prev_frame = gray
 
-            # Controlar la velocidad de captura
-            time.sleep(0.1)  # Pequeña pausa para evitar sobrecarga de CPU
-
-    def release(self):
+    def stop(self):
+        self.stop_event.set()
         self.picam2.stop()
         logging.info("Cámara liberada.")
 
-# Clase principal que coordina el proceso
-class DetectionApp:
-    def __init__(self):
-        self.config = Config()
-        self.frame_queue = Queue()
-        self.detector_process = None
-        self.camera_process = None
+
+class DetectorProcess:
+    """Proceso para la detección de objetos"""
+
+    def __init__(self, config, frame_queue, motion_event, stop_event):
+        self.config = config
+        self.frame_queue = frame_queue
+        self.motion_event = motion_event
+        self.stop_event = stop_event
         self.frame_count = 0
-
-        # Crear carpeta de salida si no existe
-        if not os.path.exists(self.config.OUTPUT_FOLDER):
-            os.makedirs(self.config.OUTPUT_FOLDER)
-            logging.info(f"Carpeta de salida creada: {self.config.OUTPUT_FOLDER}")
-
-        # Inicializar el archivo CSV
-        self.init_csv()
-
-    def init_csv(self):
+        self.csv_buffer = []
         self.csv_filepath = os.path.join(self.config.OUTPUT_FOLDER, self.config.CSV_FILENAME)
-        with open(self.csv_filepath, mode='w', newline='') as file:
-            writer = csv.writer(file)
-            writer.writerow(["Frame", "Fecha", "Hora", "Objetos Detectados", "Confidencias", "Coordenadas", "Tamaño del área"])
-        logging.info(f"Archivo CSV inicializado: {self.csv_filepath}")
+        self.detector = ObjectDetector(self.config)
 
-    def start(self):
-        # Iniciar procesos de captura y procesamiento
-        self.detector_process = Process(target=self.process_frames)
-        self.camera_process = Process(target=self.capture_frames)
-
-        self.detector_process.start()
-        self.camera_process.start()
-
-    def capture_frames(self):
-        camera_handler = CameraHandler(self.config, self.frame_queue)
+    def run(self):
         try:
-            camera_handler.capture_frames()
-        except KeyboardInterrupt:
-            pass
-        finally:
-            camera_handler.release()
+            while not self.stop_event.is_set():
+                if self.motion_event.is_set():
+                    # Procesar frames mientras se ha detectado movimiento
+                    if not self.frame_queue.empty():
+                        frame = self.frame_queue.get()
 
-    def process_frames(self):
-        detector = ObjectDetector(self.config)
-        try:
-            while True:
-                if not self.frame_queue.empty():
-                    frame = self.frame_queue.get()
+                        # Asegurar que el frame tiene 3 canales
+                        if frame.shape[2] == 4:
+                            frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
 
-                    # Verificar si el frame tiene 4 canales (por ejemplo, RGBA) y convertir a BGR
-                    if frame.shape[2] == 4:
-                        frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+                        # Realizar detección
+                        results = self.detector.detect_objects(frame)
 
-                    # Realizar detección
-                    results = detector.detect_objects(frame)
+                        # Filtrar detecciones
+                        detected_objects, confidences, coordinates, areas = self.detector.filter_detections(results)
 
-                    # Filtrar detecciones
-                    detected_objects, confidences, coordinates, areas = detector.filter_detections(results)
+                        # Anotar frame con detecciones
+                        annotated_frame = results[0].plot()
 
-                    # Anotar frame con detecciones
-                    annotated_frame = results[0].plot()
+                        # Guardar resultados
+                        self.save_results(frame, annotated_frame, detected_objects, confidences, coordinates, areas)
 
-                    # Corregir el espacio de color antes de guardar (de RGB a BGR)
-                    annotated_frame = cv2.cvtColor(annotated_frame, cv2.COLOR_RGB2BGR)
+                        # Mostrar visualización si está habilitada
+                        if self.config.ENABLE_VISUALIZATION:
+                            cv2.imshow("Detección en Tiempo Real", annotated_frame)
+                            cv2.waitKey(1)
 
-                    # Guardar resultados
-                    self.save_results(frame, annotated_frame, detected_objects, confidences, coordinates, areas)
-
-                    # Mostrar visualización si está habilitada
-                    if self.config.ENABLE_VISUALIZATION:
-                        cv2.imshow("Detección en Tiempo Real", annotated_frame)
-                        cv2.waitKey(1)
-
-                    self.frame_count += 1
+                        self.frame_count += 1
+                    else:
+                        time.sleep(0.01)  # Pequeña pausa para evitar sobrecarga de CPU
                 else:
-                    time.sleep(0.1)  # Esperar un poco si no hay frames en la cola
+                    time.sleep(0.1)  # Esperar hasta que se detecte movimiento
         except KeyboardInterrupt:
             pass
         finally:
             if self.config.ENABLE_VISUALIZATION:
                 cv2.destroyAllWindows()
+            # Escribir cualquier resultado pendiente en el CSV
+            if self.csv_buffer:
+                self.write_csv_buffer()
             logging.info("Proceso de detección finalizado.")
 
     def save_results(self, frame, annotated_frame, detected_objects, confidences, coordinates, areas):
         # Guardar la imagen anotada con el nombre del frame actual
+        logging.info(f"Guardando imagen {self.frame_count:04d}")
         frame_filename = os.path.join(self.config.OUTPUT_FOLDER, f"frame_{self.frame_count:04d}.jpg")
         cv2.imwrite(frame_filename, annotated_frame)
 
@@ -232,26 +239,75 @@ class DetectionApp:
         current_date = now.strftime("%Y-%m-%d")
         current_time = now.strftime("%H:%M:%S")
 
-        # Guardar información en el archivo CSV
-        with open(self.csv_filepath, mode='a', newline='') as file:
+        # Agregar resultados al buffer
+        self.csv_buffer.append(
+            [self.frame_count, current_date, current_time, detected_objects, confidences, coordinates, areas]
+        )
+
+        # Escribir en el CSV si se alcanza el tamaño del buffer
+        if len(self.csv_buffer) >= self.config.CSV_BUFFER_SIZE:
+            self.write_csv_buffer()
+
+    def write_csv_buffer(self):
+        with open(self.csv_filepath, mode="a", newline="") as file:
             writer = csv.writer(file)
-            writer.writerow([
-                self.frame_count,
-                current_date,
-                current_time,
-                detected_objects,
-                confidences,
-                coordinates,
-                areas
-            ])
+            writer.writerows(self.csv_buffer)
+        self.csv_buffer = []
+
+
+class DetectionApp:
+    """Clase principal para la aplicación de detección de objetos"""
+
+    def __init__(self):
+        self.config = Config()
+        self.frame_queue = Queue()
+        self.motion_event = Event()
+        self.stop_event = Event()
+        self.detector_process = None
+        self.frame_capture_thread = None
+
+        # Crear carpeta de salida si no existe
+        if not os.path.exists(self.config.OUTPUT_FOLDER):
+            os.makedirs(self.config.OUTPUT_FOLDER)
+            logging.info(f"Carpeta de salida creada: {self.config.OUTPUT_FOLDER}")
+
+        # Inicializar el archivo CSV
+        self.csv_filepath = os.path.join(self.config.OUTPUT_FOLDER, self.config.CSV_FILENAME)
+        self.init_csv()
+
+    def init_csv(self):
+        # Escribir la cabecera del CSV
+        with open(self.csv_filepath, mode="w", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerow(
+                ["Frame", "Fecha", "Hora", "Objetos Detectados", "Confidencias", "Coordenadas", "Tamaño del área"]
+            )
+        logging.info(f"Archivo CSV inicializado: {self.csv_filepath}")
+
+    def start(self):
+        # Iniciar hilo de captura de frames
+        self.frame_capture_thread = FrameCapture(self.config, self.frame_queue, self.motion_event, self.stop_event)
+        self.frame_capture_thread.start()
+
+        # Iniciar proceso de detección
+        self.detector_process_instance = DetectorProcess(
+            self.config, self.frame_queue, self.motion_event, self.stop_event
+        )
+        self.detector_process = Process(target=self.detector_process_instance.run)
+        self.detector_process.start()
 
     def signal_handler(self, sig, frame):
         logging.info("Deteniendo la aplicación...")
-        self.detector_process.terminate()
-        self.camera_process.terminate()
+        self.stop_event.set()
+
+        # Detener el hilo de captura de frames
+        self.frame_capture_thread.stop()
+        self.frame_capture_thread.join()
+
+        # Terminar el proceso de detección
         self.detector_process.join()
-        self.camera_process.join()
-        exit(0)
+
+        logging.info("Aplicación detenida correctamente.")
 
     def run(self):
         # Manejar señal para Ctrl+C
@@ -265,6 +321,7 @@ class DetectionApp:
                 time.sleep(1)
         except KeyboardInterrupt:
             self.signal_handler(None, None)
+
 
 if __name__ == "__main__":
     app = DetectionApp()
