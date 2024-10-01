@@ -1,3 +1,6 @@
+#
+# Primera versión del script de análisis de video con detección de objetos en tiempo real.
+#
 import csv
 import os
 import signal
