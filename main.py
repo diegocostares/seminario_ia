@@ -3,26 +3,25 @@ import functools
 import logging
 import os
 import signal
+import tempfile
 import threading
 from contextlib import contextmanager
 from datetime import datetime
 from queue import Empty, Queue
 from typing import List, Optional, Tuple
 
-import cv2
+import cv2  # opencv-python
 import numpy as np
-from picamera2 import Picamera2
+import requests
+from dotenv import load_dotenv
 from ultralytics import YOLO
+
+load_dotenv()
 
 # Configuración del registro (logging)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    # Para agregar un archivo de log, descomenta las líneas siguientes:
-    # handlers=[
-    #     logging.StreamHandler(),
-    #     logging.FileHandler("application.log")
-    # ]
 )
 
 
@@ -43,36 +42,116 @@ def handle_exceptions(func):
 @contextmanager
 def managed_camera(config: "Config"):
     """Context manager para manejar la cámara."""
-    picam2 = Picamera2()
-    try:
-        camera_config = picam2.create_preview_configuration(main={"size": config.CAMERA_RESOLUTION})
-        picam2.configure(camera_config)
-        picam2.start()
-        logging.info("Cámara iniciada.")
-        yield picam2
-    finally:
-        picam2.stop()
-        logging.info("Cámara detenida y liberada.")
+    if config.MODE == "prod":
+        # Usar la cámara de Raspberry Pi
+        from picamera2 import Picamera2
+
+        picam2 = Picamera2()
+        try:
+            camera_config = picam2.create_preview_configuration(main={"size": config.CAMERA_RESOLUTION})
+            picam2.configure(camera_config)
+            picam2.start()
+            logging.info("Cámara de Raspberry Pi iniciada.")
+            yield picam2
+        finally:
+            picam2.stop()
+            logging.info("Cámara de Raspberry Pi detenida y liberada.")
+    else:
+        # Usar la webcam del PC
+        cap = cv2.VideoCapture(0)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.CAMERA_RESOLUTION[0])
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.CAMERA_RESOLUTION[1])
+        if not cap.isOpened():
+            logging.error("No se pudo abrir la cámara web.")
+            raise Exception("No se pudo abrir la cámara web.")
+        logging.info("Webcam del PC iniciada.")
+        try:
+            yield cap
+        finally:
+            cap.release()
+            logging.info("Webcam del PC detenida y liberada.")
 
 
 class Config:
-    ENABLE_VISUALIZATION: bool = False      # Controla si se muestra la ventana de video (True/False)
+    ENABLE_VISUALIZATION: bool = False  # Controla si se muestra la ventana de video (True/False)
     DETECTION_LIST: List[str] = ["person"]  # Lista de objetos a detectar
-    CONFIDENCE_THRESHOLD: float = 0.15       # Confianza mínima para detectar objetos
-    OUTPUT_FOLDER: str = "output"           # Carpeta de salida para imágenes y CSV
-    CSV_FILENAME: str = "detections.csv"    # Nombre del archivo CSV para almacenar resultados
-    MIN_MOTION_AREA: int = 5000             # Área mínima de movimiento para considerar que hay cambio
-    RESIZE_WIDTH: int = 640                 # Ancho al que se redimensionará la imagen para detección de movimiento
-    CAMERA_RESOLUTION: Tuple[int, int] = (640, 360) # Resolución de la cámara (ancho, alto)
-    MODEL_NAME: str = "yolov8x.pt"          # Modelo YOLOv8 a utilizar
-    CSV_BUFFER_SIZE: int = 2                # Número de entradas antes de escribir en el CSV
-    MOTION_DETECTION_COOLDOWN: int = 5      # Segundos de espera después de detectar movimiento
-    QUEUE_MAXSIZE: int = 5                  # Tamaño máximo de la cola de frames
-    BACKGROUND_SUBTRACTOR: dict = {         # Configuración para createBackgroundSubtractorKNN
+    CONFIDENCE_THRESHOLD: float = 0.2  # Confianza mínima para detectar objetos
+    OUTPUT_FOLDER: str = "output"  # Carpeta de salida para imágenes y CSV
+    CSV_FILENAME: str = "detections.csv"  # Nombre del archivo CSV para almacenar resultados
+    MIN_MOTION_AREA: int = 5000  # Área mínima de movimiento para considerar que hay cambio
+    CAMERA_RESOLUTION: Tuple[int, int] = (640, 360)  # Resolución de la cámara (ancho, alto)
+    MODEL_NAME: str = "yolov8x.pt"  # Modelo YOLOv8 a utilizar
+    CSV_BUFFER_SIZE: int = 2  # Número de entradas antes de escribir en el CSV
+    MOTION_DETECTION_COOLDOWN: int = 5  # Segundos de espera después de detectar movimiento
+    QUEUE_MAXSIZE: int = 5  # Tamaño máximo de la cola de frames
+    BACKGROUND_SUBTRACTOR: dict = {  # Configuración para createBackgroundSubtractorKNN
         "history": 500,
         "dist2Threshold": 400.0,
         "detectShadows": False,
     }
+    # Modo de operación: "dev" para PC, "prod" para Raspberry Pi
+    MODE: str = os.getenv("MODE", "prod")
+
+    # Variables de entorno para Telegram
+    TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN")
+    TELEGRAM_IMAGE_CHANNEL_ID: str = os.getenv("TELEGRAM_IMAGE_CHANNEL_ID")
+    TELEGRAM_LOG_CHANNEL_ID: str = os.getenv("TELEGRAM_LOG_CHANNEL_ID")
+
+    # Variable para controlar la eliminación de imágenes después de enviarlas
+    DELETE_SENT_IMAGES: bool = os.getenv("DELETE_SENT_IMAGES", "True").lower() in ("true", "1", "t")
+
+
+class TelegramHandler(logging.Handler):
+    """Logging handler personalizado para enviar logs a un canal de Telegram."""
+
+    def __init__(self, bot_token: str, chat_id: str):
+        super().__init__()
+        self.bot_token = bot_token
+        self.chat_id = chat_id
+        self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
+
+    def emit(self, record):
+        log_entry = self.format(record)
+        try:
+            send_request("sendMessage", chat_id=self.chat_id, text=log_entry)
+        except Exception as e:
+            print(f"Error al enviar log a Telegram: {e}")
+
+
+class TelegramNotifier:
+    """Clase para manejar el envío de mensajes y fotos a Telegram."""
+
+    def __init__(self, config: Config):
+        self.bot_token = config.TELEGRAM_BOT_TOKEN
+        self.image_chat_id = config.TELEGRAM_IMAGE_CHANNEL_ID
+        self.log_chat_id = config.TELEGRAM_LOG_CHANNEL_ID
+        self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
+
+    def send_message(self, text: str):
+        payload = {"chat_id": self.log_chat_id, "text": text}
+        try:
+            send_request("sendMessage", **payload)
+            logging.info("Mensaje enviado a Telegram.")
+        except Exception as e:
+            logging.error(f"Error al enviar mensaje a Telegram: {e}")
+
+    def send_document(self, document_path: str, caption: str = ""):
+        payload = {"chat_id": self.image_chat_id, "caption": caption}
+        try:
+            with open(document_path, "rb") as doc:
+                files = {"document": doc}
+                send_request("sendDocument", data=payload, files=files)
+            logging.info(f"Documento enviado a Telegram: {document_path}")
+        except Exception as e:
+            logging.error(f"Error al enviar documento a Telegram: {e}")
+
+
+def send_request(method: str, data=None, files=None, **kwargs):
+    """Función genérica para enviar solicitudes a la API de Telegram."""
+    url = f"https://api.telegram.org/bot{os.getenv('TELEGRAM_BOT_TOKEN')}/{method}"
+    response = requests.post(url, data=data, files=files, **kwargs)
+    if response.status_code != 200:
+        raise Exception(f"Telegram API error: {response.status_code} - {response.text}")
 
 
 class ObjectDetector:
@@ -157,7 +236,7 @@ class FrameCapture(threading.Thread):
     def run(self):
         """Método principal que ejecuta el hilo de captura de frames."""
         last_motion_time: Optional[datetime] = None
-        with managed_camera(self.config) as picam2:
+        with managed_camera(self.config) as camera:
             backSub = cv2.createBackgroundSubtractorKNN(
                 history=self.config.BACKGROUND_SUBTRACTOR["history"],
                 dist2Threshold=self.config.BACKGROUND_SUBTRACTOR["dist2Threshold"],
@@ -167,7 +246,13 @@ class FrameCapture(threading.Thread):
 
             while not self.stop_event.is_set():
                 # Capturar un frame de la cámara
-                frame: np.ndarray = picam2.capture_array()
+                if self.config.MODE == "prod":
+                    frame: np.ndarray = camera.capture_array()
+                else:
+                    ret, frame = camera.read()
+                    if not ret:
+                        logging.error("No se pudo leer el frame de la webcam.")
+                        continue
 
                 # Aplicar el sustractor de fondo para detectar movimiento
                 fg_mask: np.ndarray = backSub.apply(frame)
@@ -223,6 +308,7 @@ class DetectorThread(threading.Thread):
         self.csv_buffer: List[List] = []
         self.csv_filepath: str = os.path.join(self.config.OUTPUT_FOLDER, self.config.CSV_FILENAME)
         self.detector = ObjectDetector(self.config)
+        self.telegram_notifier = TelegramNotifier(self.config)
 
     @handle_exceptions
     def run(self) -> None:
@@ -298,10 +384,42 @@ class DetectorThread(threading.Thread):
         areas: List[Tuple[int, int]],
     ) -> None:
         """Guarda los resultados de la detección en imágenes y CSV."""
-        # Guardar la imagen anotada con el nombre del frame actual
-        logging.info(f"Guardando imagen {self.frame_count:04d}")
-        frame_filename: str = os.path.join(self.config.OUTPUT_FOLDER, f"frame_{self.frame_count:04d}.jpg")
-        cv2.imwrite(frame_filename, annotated_frame)
+        if self.config.DELETE_SENT_IMAGES:
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False, dir=self.config.OUTPUT_FOLDER) as tmp_file:
+                frame_filename = tmp_file.name
+                cv2.imwrite(frame_filename, annotated_frame)
+        else:
+            # Guardar la imagen en la carpeta de salida
+            frame_filename = os.path.join(self.config.OUTPUT_FOLDER, f"frame_{self.frame_count:04d}.jpg")
+            cv2.imwrite(frame_filename, annotated_frame)
+
+        logging.info(f"Imagen guardada: {frame_filename}")
+
+        # Formatear las coordenadas para el mensaje
+        coordenadas_formateadas = "; ".join([f"({x_min}, {y_min}, {x_max}, {y_max})" for x_min, y_min, x_max, y_max in coordinates])
+
+        # Obtener la hora específica
+        now: datetime = datetime.now()
+        hora_especifica: str = now.strftime("%Y-%m-%d %H:%M:%S")
+
+        # Construir el caption con información adicional
+        caption = (
+            f"Frame {self.frame_count:04d}\n"
+            f"Hora: {hora_especifica}\n"
+            f"Objetos Detectados: {', '.join(detected_objects)}\n"
+            f"Coordenadas: {coordenadas_formateadas}"
+        )
+
+        # Enviar la imagen al canal de imágenes en Telegram como documento
+        self.telegram_notifier.send_document(frame_filename, caption=caption)
+
+        # Eliminar la imagen si está configurado
+        if self.config.DELETE_SENT_IMAGES:
+            try:
+                os.remove(frame_filename)
+                logging.info(f"Imagen eliminada: {frame_filename}")
+            except Exception as e:
+                logging.error(f"Error al eliminar la imagen {frame_filename}: {e}")
 
         # Obtener fecha y hora actuales
         now: datetime = datetime.now()
@@ -348,6 +466,17 @@ class DetectionApp:
         self.detector_thread: Optional[DetectorThread] = None
         self.frame_capture_thread: Optional[FrameCapture] = None
 
+        # Verificar que las variables de entorno de Telegram estén configuradas
+        if not all(
+            [
+                self.config.TELEGRAM_BOT_TOKEN,
+                self.config.TELEGRAM_IMAGE_CHANNEL_ID,
+                self.config.TELEGRAM_LOG_CHANNEL_ID,
+            ]
+        ):
+            logging.error("Las variables de entorno de Telegram no están configuradas correctamente.")
+            raise EnvironmentError("Variables de entorno de Telegram faltantes.")
+
         # Crear carpeta de salida si no existe
         try:
             os.makedirs(self.config.OUTPUT_FOLDER, exist_ok=True)
@@ -359,6 +488,9 @@ class DetectionApp:
         # Inicializar el archivo CSV
         self.csv_filepath: str = os.path.join(self.config.OUTPUT_FOLDER, self.config.CSV_FILENAME)
         self.init_csv()
+
+        # Configurar el handler de logs para Telegram
+        self.setup_telegram_logging()
 
     @handle_exceptions
     def init_csv(self) -> None:
@@ -378,6 +510,17 @@ class DetectionApp:
                     ]
                 )
             logging.info(f"Archivo CSV inicializado: {self.csv_filepath}")
+
+    def setup_telegram_logging(self) -> None:
+        """Configura el logging para enviar mensajes a Telegram."""
+        telegram_handler = TelegramHandler(
+            bot_token=self.config.TELEGRAM_BOT_TOKEN, chat_id=self.config.TELEGRAM_LOG_CHANNEL_ID
+        )
+        telegram_handler.setLevel(logging.ERROR)  # Enviar solo mensajes de nivel ERROR o superior
+        formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+        telegram_handler.setFormatter(formatter)
+        logging.getLogger().addHandler(telegram_handler)
+        logging.info("Handler de Telegram para logs configurado.")
 
     @handle_exceptions
     def start(self) -> None:
@@ -404,7 +547,6 @@ class DetectionApp:
         # Detener el hilo de captura de frames
         if self.frame_capture_thread and self.frame_capture_thread.is_alive():
             try:
-                self.frame_capture_thread.stop()
                 self.frame_capture_thread.join(timeout=5)
                 logging.info("FrameCaptureThread detenido.")
             except Exception as e:
@@ -418,6 +560,7 @@ class DetectionApp:
             except Exception as e:
                 logging.error(f"Error al detener DetectorThread: {e}")
 
+        self.telegram_notifier.send_message("La aplicación de detección de objetos ha finalizado correctamente.")
         logging.info("Aplicación detenida correctamente.")
 
     def signal_handler(self, sig: int, frame: Optional[object]) -> None:
@@ -446,4 +589,9 @@ if __name__ == "__main__":
         app = DetectionApp()
         app.run()
     except Exception as e:
-        logging.critical(f"Error crítico en la aplicación: {e}", exc_info=True)
+        error_message = f"Error crítico en la aplicación: {e}"
+        logging.critical(error_message, exc_info=True)
+        # Enviar el log de error al canal de logs
+        if app.telegram_notifier:
+            app.telegram_notifier.send_message(error_message)
+        exit(1)
