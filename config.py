@@ -42,3 +42,6 @@ class Config:
 
     # Configuración de niveles de log
     LOG_CONSOLE_LEVEL: str = os.getenv("LOG_CONSOLE_LEVEL", "WARNING")
+
+    # Para guardar los rectangulos en la deteccion de imagenes
+    SAVE_RECTANGLES: bool = os.getenv("SAVE_RECTANGLES", "False").lower() in ("true", "1", "t")

@@ -220,11 +220,11 @@ class DetectorThread(threading.Thread):
             # Filtrar detecciones
             detected_objects, confidences, coordinates, areas = self.detector.filter_detections(results)
 
-            # Anotar frame con detecciones
-            annotated_frame = results[0].plot()
+            # Anotar frame con detecciones si hay objetos detectados
+            annotated_frame = results[0].plot() if detected_objects else frame.copy()
 
             # Guardar resultados
-            self.save_results(annotated_frame, detected_objects, confidences, coordinates, areas)
+            self.save_results(frame, annotated_frame, detected_objects, confidences, coordinates, areas)
 
             # Mostrar visualización si está habilitada
             self.display_results(annotated_frame)
@@ -254,6 +254,7 @@ class DetectorThread(threading.Thread):
     @handle_exceptions
     def save_results(
         self,
+        original_frame: np.ndarray,
         annotated_frame: np.ndarray,
         detected_objects: List[str],
         confidences: List[float],
@@ -261,17 +262,28 @@ class DetectorThread(threading.Thread):
         areas: List[Tuple[int, int]],
     ) -> None:
         """Guarda los resultados de la detección en imágenes y CSV."""
+
+        # Si no hay objetos detectados, no guardar el resultado
+        if not detected_objects:
+            return
         try:
+            # Decidir qué frame guardar
+            if self.config.SAVE_RECTANGLES:
+                frame_to_save = annotated_frame
+            else:
+                frame_to_save = original_frame
+
+            # Guardar la imagen en archivo temporal o permanente
             if self.config.DELETE_SENT_IMAGES:
                 with tempfile.NamedTemporaryFile(
                     suffix=".jpg", delete=False, dir=self.config.OUTPUT_FOLDER
                 ) as tmp_file:
                     frame_filename = tmp_file.name
-                    cv2.imwrite(frame_filename, annotated_frame)
+                    cv2.imwrite(frame_filename, frame_to_save)
             else:
                 # Guardar la imagen en la carpeta de salida
                 frame_filename = os.path.join(self.config.OUTPUT_FOLDER, f"frame_{self.frame_count:04d}.jpg")
-                cv2.imwrite(frame_filename, annotated_frame)
+                cv2.imwrite(frame_filename, frame_to_save)
 
             logging.debug(f"Imagen guardada: {frame_filename}")
 
@@ -304,7 +316,6 @@ class DetectorThread(threading.Thread):
                     self.telegram_notifier.send_message(f"Error al eliminar la imagen {frame_filename}: {e}")
 
             # Obtener fecha y hora actuales
-            now: datetime = datetime.now()
             current_date: str = now.strftime("%Y-%m-%d")
             current_time: str = now.strftime("%H:%M:%S")
 
