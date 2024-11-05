@@ -1,8 +1,4 @@
-"""
-config.py
-
-Este módulo define la clase Config que almacena todas las configuraciones necesarias para la aplicación de detección de objetos. Incluye configuraciones de cámara, detección, Telegram y opciones de visualización.
-"""
+# config.py
 
 import os
 from typing import List, Tuple
@@ -14,21 +10,28 @@ load_dotenv()
 
 class Config:
     ENABLE_VISUALIZATION: bool = False  # Controla si se muestra la ventana de video (True/False)
-    DETECTION_LIST: List[str] = ["person"]  # Lista de objetos a detectar
-    CONFIDENCE_THRESHOLD: float = 0.2  # Confianza mínima para detectar objetos
-    OUTPUT_FOLDER: str = "output"  # Carpeta de salida para imágenes y CSV
-    CSV_FILENAME: str = "detections.csv"  # Nombre del archivo CSV para almacenar resultados
+    OUTPUT_FOLDER: str = "output"  # Carpeta de salida para imágenes
     MIN_MOTION_AREA: int = 5000  # Área mínima de movimiento para considerar que hay cambio
-    CAMERA_RESOLUTION: Tuple[int, int] = (640, 360)  # Resolución de la cámara (ancho, alto)
-    MODEL_NAME: str = "yolov8x.pt"  # Modelo YOLOv8 a utilizar
-    CSV_BUFFER_SIZE: int = 2  # Número de entradas antes de escribir en el CSV
+    CAMERA_RESOLUTION: Tuple[int, int] = (
+        int(os.getenv("CAMERA_WIDTH", 2000)),
+        int(os.getenv("CAMERA_HEIGHT", 1000)),
+    )  # Resolución de la cámara (ancho, alto)
+
     MOTION_DETECTION_COOLDOWN: int = 5  # Segundos de espera después de detectar movimiento
-    QUEUE_MAXSIZE: int = 5  # Tamaño máximo de la cola de frames
     BACKGROUND_SUBTRACTOR: dict = {  # Configuración para createBackgroundSubtractorKNN
         "history": 500,
         "dist2Threshold": 400.0,
         "detectShadows": False,
     }
+
+    # Intervalo de detección de movimiento en segundos
+    DETECTION_INTERVAL: float = float(os.getenv("DETECTION_INTERVAL", 1.5))
+
+    # Controla si las imágenes se guardan en disco o solo se envían
+    SAVE_IMAGES: bool = os.getenv("SAVE_IMAGES", "False").lower() in ("true", "1", "t")
+    DELETE_SENT_IMAGES: bool = os.getenv("DELETE_SENT_IMAGES", "True").lower() in ("true", "1", "t")
+    QUEUE_MAXSIZE: int = int(os.getenv("QUEUE_MAXSIZE", 20))  # Tamaño máximo de la cola de frames
+
     # Modo de operación: "dev" para PC, "prod" para Raspberry Pi
     MODE: str = os.getenv("MODE", "prod")
 
@@ -37,11 +40,8 @@ class Config:
     TELEGRAM_IMAGE_CHANNEL_ID: str = os.getenv("TELEGRAM_IMAGE_CHANNEL_ID")
     TELEGRAM_LOG_CHANNEL_ID: str = os.getenv("TELEGRAM_LOG_CHANNEL_ID")
 
-    # Variable para controlar la eliminación de imágenes después de enviarlas
-    DELETE_SENT_IMAGES: bool = os.getenv("DELETE_SENT_IMAGES", "True").lower() in ("true", "1", "t")
-
     # Configuración de niveles de log
     LOG_CONSOLE_LEVEL: str = os.getenv("LOG_CONSOLE_LEVEL", "WARNING")
 
-    # Para guardar los rectangulos en la deteccion de imagenes
-    SAVE_RECTANGLES: bool = os.getenv("SAVE_RECTANGLES", "False").lower() in ("true", "1", "t")
+    # Puntos del área de interés en la imagen
+    POLYGON_POINTS: List[Tuple[int, int]] = [(720, 215), (1150, 225), (1800, 650), (750, 800)]

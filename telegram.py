@@ -70,3 +70,13 @@ class TelegramNotifier:
             logging.debug(f"Documento enviado a Telegram: {document_path}")
         except Exception as e:
             logging.error(f"Error al enviar documento a Telegram: {e}")
+
+    def send_image_as_document(self, image_bytes: bytes, caption: str = "", filename: str = "image.jpg"):
+        """Envía una imagen en formato bytes como documento a Telegram."""
+        payload = {"chat_id": self.image_chat_id, "caption": caption}
+        files = {"document": (filename, image_bytes, "application/octet-stream")}
+        try:
+            self._send_with_retries("sendDocument", data=payload, files=files)
+            logging.debug("Imagen enviada como documento a Telegram.")
+        except Exception as e:
+            logging.error(f"Error al enviar imagen como documento a Telegram: {e}")
